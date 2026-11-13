@@ -83,4 +83,28 @@ class Selector:
 
     def analyze(self, expr):
         """Calcule mínimos por nó/classe sem emitir instruções."""
-        raise NotImplementedError("implemente matching e DP")
+        table = SelectionTable()
+
+        # percurso em pos-ordem sobre a arvore de expressao
+        def post_order(node):
+            if node is None:
+                return
+
+            # primeiro visita todos os filhos
+            for child in children(node):
+                post_order(child)
+
+            # avalia cada regra declarada para o no
+            for rule in self.rules:
+                choice = match_rule(node, rule, table)
+                if choice is None:
+                    continue
+
+                # busca escolha atual para a classe oferecida pela regra
+                current = table.lookup(node, rule.result)
+                # se nao tiver escolha ou se o novo custo for estritamente menor, atualiza
+                if current is None or choice.cost < current.cost:
+                    table.put(node, rule.result, choice)
+
+        post_order(expr)
+        return table
