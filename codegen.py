@@ -11,6 +11,7 @@ from ir import (
     PrintInt, PrintBool, PrintString,
     ProgramIR, FunctionIR, Context, Param,
     Add, Sub, Mul, Div, Rem, Neg, Addi, Slli, Call, Li,
+    Slt, Xor, Seqz, Snez, Beq, Bne, Blt, Bge, Bnez,
 )
 from patterns import REG, COND, EFFECT, signed_literal
 from selector import Selector
@@ -177,6 +178,144 @@ class CodeGenerator:
         func_sym = node.metadata["symbol"]
         args = [self.expression(arg, REG) for arg in node.arguments]
         self.ctx.emit(Call(None, func_sym, args, origin=node.span))
+        return None
+
+    # acoes emissoras para comparacoes relacionais em reg
+    def emit_comp_reg(self, node, choice, true_label=None, false_label=None):
+        # avalia ambos os operandos em reg
+        lhs = self.expression(choice.subproblems[0][0], REG)
+        rhs = self.expression(choice.subproblems[1][0], REG)
+        dst = self.ctx.temp()
+
+        op = node.operator
+        if op == BinaryOperator.LESS:
+            # lhs < rhs usa slt
+            self.ctx.emit(Slt(dst, lhs, rhs, origin=node.span))
+        elif op == BinaryOperator.GREATER:
+            # lhs > rhs vira rhs < lhs usando slt
+            self.ctx.emit(Slt(dst, rhs, lhs, origin=node.span))
+        elif op == BinaryOperator.LESS_EQUAL:
+            # lhs <= rhs eh !(rhs < lhs), usando slt e seqz
+            tmp = self.ctx.temp()
+            self.ctx.emit(Slt(tmp, rhs, lhs, origin=node.span))
+            self.ctx.emit(Seqz(dst, tmp, origin=node.span))
+        elif op == BinaryOperator.GREATER_EQUAL:
+            # lhs >= rhs eh !(lhs < rhs), usando slt e seqz
+            tmp = self.ctx.temp()
+            self.ctx.emit(Slt(tmp, lhs, rhs, origin=node.span))
+            self.ctx.emit(Seqz(dst, tmp, origin=node.span))
+        elif op == BinaryOperator.EQUAL:
+            # igualdade compara diferenca com xor e testa zero com seqz
+            tmp = self.ctx.temp()
+            self.ctx.emit(Xor(tmp, lhs, rhs, origin=node.span))
+            self.ctx.emit(Seqz(dst, tmp, origin=node.span))
+        elif op == BinaryOperator.NOT_EQUAL:
+            # desigualdade compara diferenca com xor e testa nao zero com snez
+            tmp = self.ctx.temp()
+            self.ctx.emit(Xor(tmp, lhs, rhs, origin=node.span))
+            self.ctx.emit(Snez(dst, tmp, origin=node.span))
+
+        return dst
+
+    # acoes emissoras para comparacoes relacionais em cond
+    def emit_comp_cond(self, node, choice, true_label=None, false_label=None):
+        # avalia operandos em reg e desvia diretamente com branch e jump
+        lhs = self.expression(choice.subproblems[0][0], REG)
+        rhs = self.expression(choice.subproblems[1][0], REG)
+
+        op = node.operator
+        if op == BinaryOperator.LESS:
+            self.ctx.emit(Blt(lhs, rhs, true_label, origin=node.span))
+        elif op == BinaryOperator.GREATER:
+            self.ctx.emit(Blt(rhs, lhs, true_label, origin=node.span))
+        elif op == BinaryOperator.LESS_EQUAL:
+            self.ctx.emit(Bge(rhs, lhs, true_label, origin=node.span))
+        elif op == BinaryOperator.GREATER_EQUAL:
+            self.ctx.emit(Bge(lhs, rhs, true_label, origin=node.span))
+        elif op == BinaryOperator.EQUAL:
+            self.ctx.emit(Beq(lhs, rhs, true_label, origin=node.span))
+        elif op == BinaryOperator.NOT_EQUAL:
+            self.ctx.emit(Bne(lhs, rhs, true_label, origin=node.span))
+
+        # salto incondicional para o destino falso se o branch nao desviar
+        self.ctx.emit(Jump(false_label, origin=node.span))
+        return None
+
+    # acoes emissoras para operadores logicos e negacao logica
+    def emit_not_reg(self, node, choice, true_label=None, false_label=None):
+        # negacao logica em reg testa igualdade com zero usando seqz
+        src = self.expression(choice.subproblems[0][0], REG)
+        dst = self.ctx.temp()
+        self.ctx.emit(Seqz(dst, src, origin=node.span))
+        return dst
+
+    def emit_not_cond(self, node, choice, true_label=None, false_label=None):
+        # negacao logica em cond apenas inverte os labels de destino
+        self.expression(choice.subproblems[0][0], COND, true_label=false_label, false_label=true_label)
+        return None
+
+    def emit_and_cond(self, node, choice, true_label=None, false_label=None):
+        # curto-circuito em e logico avalia segundo operando apenas se primeiro for verdadeiro
+        mid_label = self.ctx.label()
+        self.expression(node.left, COND, true_label=mid_label, false_label=false_label)
+        self.ctx.emit(LabelInstr(mid_label))
+        self.expression(node.right, COND, true_label=true_label, false_label=false_label)
+        return None
+
+    def emit_or_cond(self, node, choice, true_label=None, false_label=None):
+        # curto-circuito em ou logico avalia segundo operando apenas se primeiro for falso
+        mid_label = self.ctx.label()
+        self.expression(node.left, COND, true_label=true_label, false_label=mid_label)
+        self.ctx.emit(LabelInstr(mid_label))
+        self.expression(node.right, COND, true_label=true_label, false_label=false_label)
+        return None
+
+    def emit_logico_reg(self, node, choice, true_label=None, false_label=None):
+        # expressao logica usada como valor materializa 1 ou 0 convergindo com jumps
+        dst = self.ctx.temp()
+        l_true = self.ctx.label()
+        l_false = self.ctx.label()
+        l_end = self.ctx.label()
+
+        # avalia a expressao como condicao com curto-circuito
+        self.expression(node, COND, true_label=l_true, false_label=l_false)
+
+        # caminho verdadeiro carrega 1
+        self.ctx.emit(LabelInstr(l_true))
+        self.ctx.emit(Li(dst, 1))
+        self.ctx.emit(Jump(l_end))
+
+        # caminho falso carrega 0
+        self.ctx.emit(LabelInstr(l_false))
+        self.ctx.emit(Li(dst, 0))
+
+        self.ctx.emit(LabelInstr(l_end))
+        return dst
+
+    # acoes emissoras para booleanos usados como condicao
+    def emit_bool_cond(self, node, choice, true_label=None, false_label=None):
+        # literal booleano salta diretamente para o destino correspondente
+        if node.value:
+            self.ctx.emit(Jump(true_label, origin=node.span))
+        else:
+            self.ctx.emit(Jump(false_label, origin=node.span))
+        return None
+
+    def emit_id_cond(self, node, choice, true_label=None, false_label=None):
+        # identificador booleano testa se diferente de zero e desvia
+        var = self.ctx.variable(node.metadata["symbol"])
+        self.ctx.emit(Bnez(var, true_label, origin=node.span))
+        self.ctx.emit(Jump(false_label, origin=node.span))
+        return None
+
+    def emit_call_cond(self, node, choice, true_label=None, false_label=None):
+        # chamada booleana emite chamada, testa resultado com bnez e desvia
+        func_sym = node.metadata["symbol"]
+        args = [self.expression(arg, REG) for arg in node.arguments]
+        dst = self.ctx.temp()
+        self.ctx.emit(Call(dst, func_sym, args, origin=node.span))
+        self.ctx.emit(Bnez(dst, true_label, origin=node.span))
+        self.ctx.emit(Jump(false_label, origin=node.span))
         return None
 
     def statement(self, node):
